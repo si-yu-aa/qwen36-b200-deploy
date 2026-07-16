@@ -1,0 +1,28 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.key
+api_key
+*token*
+
+# Runtime state and large artifacts
+models/
+venvs/
+logs/
+*.log
+*.jsonl
+*.sqlite
+*.db
+__pycache__/
+*.py[cod]
+
+# Raw business data and benchmark output
+*.csv
+benchmark-output/
+bench/results/
+
+# Editors and OS files
+.idea/
+.vscode/
+.DS_Store
