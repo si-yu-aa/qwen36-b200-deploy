@@ -1,135 +1,197 @@
 # Qwen3.6-35B-A3B on Vast.ai B200
 
-在一台新的 Vast.ai B200 上重建经过实测的 Qwen3.6-35B-A3B 推理服务。部署形态是：
+在一台全新的 Vast.ai B200 上部署 Qwen3.6-35B-A3B NVFP4 + DFlash B8，并通过带 Bearer 鉴权的公网 OpenAI 兼容接口提供服务。默认不需要 SSH 端口转发。
 
-- 主模型：`nvidia/Qwen3.6-35B-A3B-NVFP4`
-- 草稿模型：`z-lab/Qwen3.6-35B-A3B-DFlash`
-- SGLang + DFlash，TP=1
-- NVFP4 GEMM / MoE：`flashinfer_trtllm`
+## 已固定的运行栈
+
+- SGLang：`ff6bbeb0055234774be911d9f76788393731ca85`
+- DFlash 修复：HH1162 `fix-draft-unquant-override` 分支
+- ModelOpt mixed loader：SGLang PR #30078，补丁 SHA256 固定并在部署时校验
+- SGLang 包：`0.5.15.post1`
+- 草稿模型：`z-lab/Qwen3.6-35B-A3B-DFlash@f181eece...`
+- DFlash block size：8
 - 主模型注意力：`trtllm_mha`
 - 草稿注意力：FA4
-- DFlash block size：8
-- Prefix caching：启用（SGLang radix cache 默认开启，没有传 `--disable-radix-cache`）
-- OpenAI 兼容 API：`127.0.0.1:30000`
-- 可选分段计时代理：`127.0.0.1:30001`
+- NVFP4 GEMM / MoE：`flashinfer_trtllm`
+- KV cache：BF16；这也是 mmangkad checkpoint 与 DFlash FA4 兼容所需的设置
+- TP：1
 
-这套配置固定了 2026-07-16 实际在线机器的 SGLang commit、模型 revision 和核心 CUDA/Python 包版本。它复现的是实测的 **B8** 配置，不是早期设想的 B16。
+主模型支持两个固定版本：
 
-## 新机器一键部署
+| `MAIN_MODEL_VARIANT` | Hugging Face checkpoint | SGLang 量化路径 |
+|---|---|---|
+| `nvidia`（默认） | `nvidia/Qwen3.6-35B-A3B-NVFP4@491c2f1e...` | `modelopt_mixed` |
+| `mmangkad` | `mmangkad/Qwen3.6-35B-A3B-NVFP4@4384ac3b...` | `modelopt_fp4` |
 
-前提：
+## 网络结构
 
-- Vast.ai NVIDIA B200，约 180 GB VRAM；
-- 使用带 `/etc/vast-agents-guide.md`、Supervisor、CUDA 13、Python 3.12 和 `uv` 的 Vast base image；
-- 建议至少 80 GB 磁盘。模型本身约 23 GB，Python/CUDA 依赖还会占用较多空间；
-- 私有 GitHub 仓库的读取权限。
+```text
+公网客户端
+  -> 0.0.0.0:8000  Bearer 鉴权代理
+  -> 127.0.0.1:30000  SGLang
 
-SSH 进入新实例后执行：
+本机计时工具
+  -> 127.0.0.1:30001  Bearer 鉴权计时代理
+  -> 127.0.0.1:30000  SGLang
+```
+
+API key 只由代理从权限为 `0600` 的文件读取，不再作为 SGLang 命令行参数，因此不会出现在 SGLang 的 `server_args` 日志中。两个代理的 HTTP keep-alive 默认是 60 秒。
+
+## 创建 Vast 实例
+
+必须在创建实例时为容器端口 `8000/tcp` 分配公网映射；Vast 不支持实例创建后再增加端口。部署脚本会读取 `VAST_TCP_PORT_8000` 或 `vast-capabilities` 验证映射，没有映射时提前报错。
+
+建议配置：
+
+- NVIDIA B200，约 180 GB VRAM；
+- 至少 100 GB 磁盘；如果同时下载两个主模型，建议 150 GB 以上；
+- 带 `/etc/vast-agents-guide.md`、Supervisor、Python 3.12 和 `uv` 的 Vast base image；
+- 将 `8000/tcp` 加入实例端口配置。
+
+`/workspace` 只有在 `vast-capabilities | jq '.instance.workspace_is_volume'` 返回 `true` 时才是持久卷。普通实例的 `destroy/recycle` 会删除源码、模型和 API key；`stop/start` 会保留。
+
+## 一键部署
 
 ```bash
 git clone git@github.com:si-yu-aa/qwen36-b200-deploy.git
 cd qwen36-b200-deploy
 
+# 公共模型可匿名下载；设置 token 可减少限流。
+export HF_TOKEN='hf_...'
+
+# 默认 NVIDIA checkpoint。
+./deploy.sh
+
+# 或部署 mmangkad checkpoint。
+# MAIN_MODEL_VARIANT=mmangkad ./deploy.sh
+```
+
+首次未设置 `QWEN36_API_KEY` 时，脚本会自动生成 64 字符密钥：
+
+```bash
+cat /workspace/.qwen36_api_key
+```
+
+也可以在首次部署前自行指定：
+
+```bash
 read -rsp 'Qwen API key: ' QWEN36_API_KEY
 echo
 export QWEN36_API_KEY
-
-# 公共模型通常可匿名下载；设置 token 可减少限流。
-export HF_TOKEN='hf_...'
-
 ./deploy.sh
 ```
 
-`deploy.sh` 会：
+脚本会：
 
-1. 确认机器是 B200 且显存足够；
-2. 检出固定的 SGLang fork 和 commit；
-3. 创建隔离 venv 并安装固定的 SGLang/CUDA 13 依赖；
-4. 按固定 Hugging Face revision 下载主模型和 DFlash 草稿模型；
-5. 把 API key 写入权限为 0600 的实例本地文件，不写入仓库；
-6. 安装并启动两个 Supervisor 服务；
-7. 等待模型 ready，核对实际进程参数并发送一次 smoke request。
+1. 校验 B200 和显存；
+2. 校验 `8000/tcp` 公网映射；
+3. checkout 可公开获取的 SGLang 基线；
+4. 下载并校验 PR #30078 补丁，再只应用运行时文件；
+5. 创建 Python 3.12 venv，并允许安装固定版本所需的 prerelease CUDA 依赖；
+6. 下载固定 revision 的主模型和 DFlash 草稿模型；
+7. 安装三个 Supervisor 服务并等待 CUDA autotune/CUDA Graph 完成；
+8. 验证参数、鉴权边界和真实生成请求。
 
-部署和下载可重复执行。已有模型、源码和 API key 会复用。常用开关：
+第一次启动通常需要 5–20 分钟，主要耗时是 FlashInfer/TRTLLM autotune、PTX 编译和 CUDA Graph。后续启动会复用编译缓存，但 CUDA Graph 仍需重新捕获。
 
-```bash
-SKIP_MODEL_DOWNLOAD=1 ./deploy.sh   # 外部 Volume 已有模型时
-SKIP_PYTHON_INSTALL=1 ./deploy.sh   # venv 已经完整时
-DFLASH_BLOCK_SIZE=16 ./deploy.sh    # 仅用于明确的 B8/B16 A/B 测试
-```
-
-## 从业务机访问
-
-服务默认不暴露公网端口。在业务机建立 SSH 隧道：
+常用覆盖项：
 
 ```bash
-ssh -N \
-  -L 31000:127.0.0.1:30000 \
-  -L 31001:127.0.0.1:30001 \
-  -p <VAST_SSH_PORT> root@<VAST_HOST>
+MAIN_MODEL_VARIANT=mmangkad ./deploy.sh
+SKIP_MODEL_DOWNLOAD=1 ./deploy.sh
+SKIP_PYTHON_INSTALL=1 ./deploy.sh
+DFLASH_BLOCK_SIZE=16 ./deploy.sh
+PROXY_KEEP_ALIVE_SECONDS=120 ./deploy.sh
 ```
 
-业务配置：
+`SKIP_PUBLIC_PORT_CHECK=1` 仅用于确认没有公网映射的私有测试实例；代理仍会绑定容器端口 8000。
 
-```text
-base_url = http://127.0.0.1:31000/v1
-model    = Qwen3.6-35B-A3B
-api_key  = 部署时的 QWEN36_API_KEY
+## 调用公网 API
+
+公网端口不是容器内的 `8000`，而是 Vast 分配的 `$VAST_TCP_PORT_8000`：
+
+```bash
+echo "http://${PUBLIC_IPADDR}:${VAST_TCP_PORT_8000}/v1"
 ```
 
-对当前 TongAI 项目，API 地址就是 `http://127.0.0.1:31000/v1`。SSH 隧道断开时本地端口会停止服务，因此生产使用建议通过 systemd 或 autossh 保活。
+测试：
 
-## 验证和运维
+```bash
+API_KEY=$(</workspace/.qwen36_api_key)
+curl -N "http://${PUBLIC_IPADDR}:${VAST_TCP_PORT_8000}/v1/chat/completions" \
+  -H "Authorization: Bearer ${API_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3.6-35B-A3B","messages":[{"role":"user","content":"你好"}],"stream":true,"max_tokens":256,"chat_template_kwargs":{"enable_thinking":false}}'
+```
+
+OpenAI Python client 应作为长生命周期对象复用，不要每个请求重新创建：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://PUBLIC_IP:PUBLIC_PORT/v1",
+    api_key="YOUR_KEY",
+)
+
+response = client.chat.completions.create(
+    model="Qwen3.6-35B-A3B",
+    messages=[{"role": "user", "content": "你好"}],
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+print(response.choices[0].message.content)
+```
+
+## 验证和版本检查
 
 在 B200 上：
 
 ```bash
-cd qwen36-b200-deploy
 ./verify.sh
-supervisorctl status qwen36-nvfp4 qwen36-timing-proxy
+supervisorctl status qwen36-nvfp4 qwen36-timing-proxy qwen36-public-api
 nvidia-smi
 ```
 
-`verify.sh` 不会打印 API key；它会确认 NVFP4、DFlash、B8、FA4、`trtllm_mha` 和 FlashInfer 参数确实出现在运行进程中，并执行真实生成请求。
+`verify.sh` 会确认：
 
-如需改启动参数，修改 [scripts/qwen36-nvfp4-sglang.sh](scripts/qwen36-nvfp4-sglang.sh)，提交后在实例上 pull 并重跑 `./deploy.sh`。所有版本入口集中在 [versions.env](versions.env)。
+- 模型路径、DFlash B8、FA4、`trtllm_mha`、FlashInfer 和 BF16 KV 参数；
+- API key 没有传给 SGLang；
+- `30001` 和 `8000` 无密钥均返回 `401`；
+- 公网代理绑定 `0.0.0.0:8000`；
+- 通过鉴权代理可以完成真实生成。
+
+不租 GPU 也可以验证所有远程 pin 是否仍然可获取：
+
+```bash
+./scripts/check-pins.sh
+```
 
 ## 真实业务流式压测
 
-计时代理只记录时间戳、字节数和请求 ID，不保存请求正文或模型输出。先把本地 `31001` 隧道连接到远端计时代理，然后运行：
+CSV 需要 `prompts` 列（OpenAI messages JSON），可选 `tools` 和 `trace_id` 列：
 
 ```bash
 mkdir -p benchmark-output
-uv run --with httpx python bench/bench_business_timed_ssh.py \
+uv run --with httpx python bench/bench_business_stream.py \
   --csv /path/to/business.csv \
-  --base-url http://127.0.0.1:31001/v1 \
-  --api-key-file /secure/path/qwen-api-key \
+  --base-url "http://${PUBLIC_IPADDR}:${VAST_TCP_PORT_8000}/v1" \
+  --api-key-file /workspace/.qwen36_api_key \
   --concurrency 1,2,4,8 \
   --requests 20 \
   --max-tokens 1024 \
   --output benchmark-output/run.json
 ```
 
-CSV 需要 `prompts` 列（OpenAI messages JSON），可选 `tools` 和 `trace_id` 列。CSV 和原始 JSON 输出都被 `.gitignore` 排除。
+原始业务 CSV、请求、输出、API key、模型、日志和 benchmark JSON 均被 `.gitignore` 排除，不应提交到仓库。
 
-分段指标的直白含义：
+## 已修复的历史问题
 
-- `uplink_to_b200_full_body_est`：本机发请求到 B200 收完请求体；
-- `b200_body_complete_to_first_token`：B200 收完请求到第一个 token 准备好；
-- `first_token_downlink_est`：B200 发第一个 token 到本机收到；
-- `b200_generation_first_to_done`：B200 上从首 token 到生成结束；
-- `last_token_downlink_est`：B200 发完最后数据到本机收完；
-- `round_trip_link_and_client_overhead`：端到端耗时扣掉 B200 代理内服务耗时后的网络与客户端总开销。
-
-单向网络时间依赖客户端/服务器时钟校准，只能视为估计值；报告里的 `one_way_uncertainty_bound_ms` 给出由最佳 RTT 推导的误差上界。端到端、B200 服务端耗时和双向网络总开销更可靠。
-
-## 数据与密钥边界
-
-仓库只保存代码、固定 revision、聚合后的性能结论和无敏感信息的配置模板。以下内容不会提交：
-
-- Qwen API key、Hugging Face token；
-- 模型权重、venv、服务日志；
-- 业务 CSV、prompt、模型输出；
-- 请求级 benchmark JSON/JSONL、SQLite。
-
-Vast 实例的 `/workspace` 是否持久化取决于是否挂载了 Volume。Git 仓库负责重建代码和环境；如果希望避免每次重新下载约 23 GB 模型，应把 `/workspace/models` 放到 Vast Volume，并在新机器上设置相同挂载路径。
+- 不再引用远程仓库不存在的本地提交 `5b386b4d...`；
+- 明确复现 `ff6bbeb... + PR #30078`；
+- 安装 SGLang 时加入 `--prerelease=allow`；
+- 兼容新版 Vast `logging.sh` 的参数约定；
+- 增加公网 Supervisor 代理和 Bearer 鉴权；
+- API key 不再进入 SGLang argv/日志；
+- mmangkad 使用 BF16 KV，避免 FP8 KV 与 DFlash FA4 的 dtype 冲突；
+- 非流式响应由代理直接返回，流式响应继续逐 token 转发；
+- 代理 keep-alive 从默认 5 秒提升到 60 秒。
