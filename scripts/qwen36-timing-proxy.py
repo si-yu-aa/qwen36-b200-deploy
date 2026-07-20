@@ -16,10 +16,13 @@ from typing import Any, AsyncIterator
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 
 UPSTREAM = os.environ.get("TIMING_PROXY_UPSTREAM", "http://127.0.0.1:30000")
+HOST = os.environ.get("TIMING_PROXY_HOST", "127.0.0.1")
+PORT = int(os.environ.get("TIMING_PROXY_PORT", "30001"))
+KEEP_ALIVE_SECONDS = int(os.environ.get("TIMING_PROXY_KEEP_ALIVE", "60"))
 API_KEY_FILE = Path(
     os.environ.get("TIMING_PROXY_API_KEY_FILE", "/workspace/.qwen36_api_key")
 )
@@ -163,7 +166,8 @@ async def timings_for_run(request: Request, run_id: str) -> JSONResponse:
     "/{path:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
 )
-async def proxy(request: Request, path: str) -> StreamingResponse:
+async def proxy(request: Request, path: str) -> Response:
+    require_auth(request)
     request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
     run_id = request.headers.get("x-benchmark-run-id")
     sequence_raw = request.headers.get("x-benchmark-sequence")
@@ -214,6 +218,25 @@ async def proxy(request: Request, path: str) -> StreamingResponse:
     response_headers["x-timing-request-id"] = request_id
     response_headers["x-accel-buffering"] = "no"
 
+    content_type = upstream_response.headers.get("content-type", "").lower()
+    if not content_type.startswith("text/event-stream"):
+        try:
+            content = await upstream_response.aread()
+            stamp(record, "first_upstream_body")
+            record["response_body_bytes"] = len(content)
+            stamp(record, "done_ready")
+            stamp(record, "done_send_complete")
+            stamp(record, "upstream_stream_complete")
+        finally:
+            await upstream_response.aclose()
+            stamp(record, "proxy_stream_finalized")
+            save_record(record)
+        return Response(
+            content=content,
+            status_code=upstream_response.status_code,
+            headers=response_headers,
+        )
+
     async def body_iterator() -> AsyncIterator[bytes]:
         try:
             async for chunk in upstream_response.aiter_raw():
@@ -262,8 +285,9 @@ async def proxy(request: Request, path: str) -> StreamingResponse:
 if __name__ == "__main__":
     uvicorn.run(
         app,
-        host="127.0.0.1",
-        port=int(os.environ.get("TIMING_PROXY_PORT", "30001")),
+        host=HOST,
+        port=PORT,
         access_log=False,
         log_level="warning",
+        timeout_keep_alive=KEEP_ALIVE_SECONDS,
     )

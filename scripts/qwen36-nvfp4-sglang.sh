@@ -12,12 +12,10 @@ SGLANG_VENV=${SGLANG_VENV:-${WORKSPACE}/venvs/sglang}
 MAIN_MODEL_DIR=${MAIN_MODEL_DIR:-${WORKSPACE}/models/Qwen3.6-35B-A3B-NVFP4}
 DRAFT_MODEL_DIR=${DRAFT_MODEL_DIR:-${WORKSPACE}/models/Qwen3.6-35B-A3B-DFlash}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-Qwen3.6-35B-A3B}
-API_KEY_FILE=${API_KEY_FILE:-${WORKSPACE}/.qwen36_api_key}
 DFLASH_BLOCK_SIZE=${DFLASH_BLOCK_SIZE:-8}
+KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-bfloat16}
 
 [[ -x ${SGLANG_VENV}/bin/python ]] || { echo "Missing Python environment" >&2; exit 1; }
-[[ -s ${API_KEY_FILE} ]] || { echo "Missing API key file" >&2; exit 1; }
-QWEN_API_KEY=$(<"${API_KEY_FILE}")
 
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export PYTHONPATH="${SGLANG_SRC}/python${PYTHONPATH:+:${PYTHONPATH}}"
@@ -40,6 +38,7 @@ args=(
   --linear-attn-decode-backend flashinfer
   --mamba-radix-cache-strategy extra_buffer
   --mamba-ssm-dtype bfloat16
+  --kv-cache-dtype "${KV_CACHE_DTYPE}"
   --tp-size 1
   --context-length 262144
   --max-running-requests 32
@@ -51,7 +50,6 @@ args=(
   --tool-call-parser qwen3_coder
   --enable-metrics
   --enable-request-time-stats-logging
-  --api-key "${QWEN_API_KEY}"
   --host 127.0.0.1
   --port 30000
 )
@@ -60,7 +58,7 @@ cd "${WORKSPACE}"
 if [[ -r /opt/supervisor-scripts/utils/logging.sh ]]; then
   # Vast's pty helper keeps long-running server output line-buffered in Supervisor.
   # shellcheck disable=SC1091
-  source /opt/supervisor-scripts/utils/logging.sh
+  source /opt/supervisor-scripts/utils/logging.sh ""
   pty "${SGLANG_VENV}/bin/python" "${args[@]}" 2>&1
 else
   exec "${SGLANG_VENV}/bin/python" "${args[@]}"
